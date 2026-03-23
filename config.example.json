@@ -11,6 +11,7 @@
   "log_file": "~/.local/log/clawdoc.log",
   "skills_file": "~/.config/clawdoc/skills.json",
   "backup_dir": "~/.config/clawdoc/backups",
+  "blocked_overrides": [],
   "watched_services": [
     {
       "name": "OpenClaw",

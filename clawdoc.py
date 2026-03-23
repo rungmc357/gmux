@@ -547,8 +547,8 @@ def watchdog_check(bot_token: str, chat_id: int, service: dict, ollama_url: str 
         analysis = ollama_chat(ollama_url, ollama_model, "", [{"role": "user", "content": ai_prompt}])
 
         # Try to extract and run the AI's suggested fix (blocklist already applied in parse_ai_response)
-        _, fix_cmd = parse_ai_response(analysis)
-        if fix_cmd and is_blocked_command(fix_cmd):
+        _, fix_cmd = parse_ai_response(analysis, bot.blocked_overrides)
+        if fix_cmd and is_blocked_command(fix_cmd, bot.blocked_overrides):
             log.warning(f"Watchdog: AI suggested blocked command, skipping: {fix_cmd}")
             fix_cmd = None
         if fix_cmd:
@@ -682,6 +682,7 @@ class BotState:
         self.ollama_url = cfg.get("ollama_url", "http://localhost:11434")
         self.ollama_model = cfg.get("ollama_model", "qwen3.5:4b")
         self.shell_security = cfg.get("shell_security", SECURITY_DISABLED)
+        self.blocked_overrides: list[str] = cfg.get("blocked_overrides", [])
         self.shell_password_hash = cfg.get("shell_password_hash", "")
         # Support legacy plaintext password, but prefer hash
         if not self.shell_password_hash and cfg.get("shell_password"):
@@ -898,7 +899,14 @@ class BotState:
 # Parse AI response for CMD:
 # ---------------------------------------------------------------------------
 
-_BLOCKED_PATTERNS = [
+# Patterns that require word-boundary matching (short tokens that cause false positives
+# when matched as substrings, e.g. "at " matching inside "cat ").
+_BLOCKED_WORD_PATTERNS = [
+    "at ", "nc ", "su -",
+]
+
+# Patterns matched as plain substrings (longer, unambiguous strings).
+_BLOCKED_SUBSTR_PATTERNS = [
     "rm -rf", "rm -f /", "mkfs", "dd if=",          # destructive
     "chmod 777", "chmod -R 777",                      # permission weakening
     "> /dev/sd", "> /dev/disk",                       # disk overwrite
@@ -906,10 +914,10 @@ _BLOCKED_PATTERNS = [
     "curl -o", "wget -O", "wget http",                # downloads
     "pip install", "pip3 install", "npm install", "brew install",  # package installation
     "apt install", "apt-get install", "yum install",
-    "sudo ", "su -", "su root",                        # privilege escalation
+    "sudo ", "su root",                                # privilege escalation
     "ssh ", "scp ", "rsync ",                          # remote access
-    "nc ", "netcat ", "ncat ",                         # network tools
-    "crontab", "at ", "nohup ",                        # scheduled execution
+    "netcat ", "ncat ",                                # network tools
+    "crontab", "nohup ",                               # scheduled execution
     "/etc/passwd", "/etc/shadow", ".ssh/",             # sensitive files
     "base64 -d", "eval ", "exec(",                     # code execution tricks
     "python3 -c", "python -c", "perl -e", "ruby -e",  # inline script execution
@@ -923,12 +931,37 @@ _BLOCKED_PATTERNS = [
 ]
 
 
-def is_blocked_command(cmd: str) -> bool:
-    """Check if a command matches any blocked pattern."""
+def is_blocked_command(cmd: str, extra_overrides: list[str] | None = None) -> bool:
+    """Check if a command matches any blocked pattern.
+
+    Args:
+        cmd: The shell command to check.
+        extra_overrides: Optional list of pattern strings to skip (from config
+            ``blocked_overrides``). Matching is case-insensitive substring.
+    """
+    import re
+    overrides = [o.lower() for o in (extra_overrides or [])]
     cmd_lower = cmd.lower().strip()
-    for pattern in _BLOCKED_PATTERNS:
+
+    def is_overridden(pattern: str) -> bool:
+        return pattern.lower() in overrides
+
+    # Word-boundary patterns
+    for pattern in _BLOCKED_WORD_PATTERNS:
+        if is_overridden(pattern):
+            continue
+        # Match only when the token appears as a standalone word/command
+        token = re.escape(pattern.strip())
+        if re.search(r'(?<![\w/])'  + token + r'(?![\w])', cmd_lower):
+            return True
+
+    # Substring patterns
+    for pattern in _BLOCKED_SUBSTR_PATTERNS:
+        if is_overridden(pattern):
+            continue
         if pattern.lower() in cmd_lower:
             return True
+
     return False
 
 
@@ -985,14 +1018,14 @@ def _summarize_output(bot, cmd: str, output: str, failed: bool = False, exit_cod
     return f"✅ Done.\n```\n{display_out}\n```"
 
 
-def parse_ai_response(response: str) -> tuple[str, str | None]:
+def parse_ai_response(response: str, blocked_overrides: list[str] | None = None) -> tuple[str, str | None]:
     lines = response.strip().splitlines()
     cmd = None
     text_lines = []
     for line in lines:
         if line.strip().startswith("CMD:"):
             candidate = line.strip()[4:].strip()
-            if is_blocked_command(candidate):
+            if is_blocked_command(candidate, blocked_overrides):
                 text_lines.append(f"⚠️ _Blocked unsafe command: `{candidate}`_")
                 log.warning(f"Blocked AI-suggested command: {candidate}")
             else:
@@ -1800,7 +1833,7 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
             bot.conversation[:-1] + [{"role": "user", "content": enriched_prompt}]
         )
         bot.add_to_context("assistant", response)
-        text_part, cmd = parse_ai_response(response)
+        text_part, cmd = parse_ai_response(response, bot.blocked_overrides)
         if cmd:
             bot.send_with_approval(text_part or "Here's what I'd run:", cmd)
         else:
