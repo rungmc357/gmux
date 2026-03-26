@@ -9,6 +9,7 @@ Optional: ollama (AI diagnostics), openai-whisper or fluid-transcribe (voice)
 """
 
 import argparse
+import difflib
 import hashlib
 import json
 import logging
@@ -18,6 +19,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -123,6 +125,42 @@ def edit_message(bot_token: str, chat_id: int, message_id: int, text: str):
 
 def answer_callback(bot_token: str, callback_query_id: str, text: str = ""):
     tg_api(bot_token, "answerCallbackQuery", callback_query_id=callback_query_id, text=text)
+
+
+def send_document(bot_token: str, chat_id: int, file_bytes: bytes, filename: str, caption: str = ""):
+    """Send a file as a Telegram document using multipart/form-data."""
+    import io
+    boundary = uuid.uuid4().hex
+    body = io.BytesIO()
+
+    def write_field(name, value):
+        body.write(f"--{boundary}\r\n".encode())
+        body.write(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        body.write(f"{value}\r\n".encode())
+
+    write_field("chat_id", str(chat_id))
+    if caption:
+        write_field("caption", caption)
+
+    body.write(f"--{boundary}\r\n".encode())
+    body.write(f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'.encode())
+    body.write(b"Content-Type: application/octet-stream\r\n\r\n")
+    body.write(file_bytes)
+    body.write(b"\r\n")
+    body.write(f"--{boundary}--\r\n".encode())
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    req = urllib.request.Request(
+        url, data=body.getvalue(),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        log.error(f"sendDocument error: {e}")
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Shell
@@ -376,7 +414,7 @@ def system_status() -> str:
 # Watchdog
 # ---------------------------------------------------------------------------
 
-def watchdog_check(bot_token: str, chat_id: int, service: dict, ollama_url: str = "", ollama_model: str = ""):
+def watchdog_check(bot_token: str, chat_id: int, service: dict, ollama_url: str = "", ollama_model: str = "", bot_state: "BotState | None" = None):
     url = service.get("url", "")
     name = service.get("name", url)
     restart_cmd = service.get("restart_cmd", "")
@@ -444,10 +482,12 @@ def watchdog_check(bot_token: str, chat_id: int, service: dict, ollama_url: str 
         backup_path = diag["latest_backup"]
         config_path = str(Path("~/.openclaw/openclaw.json").expanduser())
         log.info(f"Watchdog: {name} config broken, restoring from {backup_path}")
-        restore_out, restore_code = run_cmd(f"cp {backup_path} {config_path}")
+        restore_out, restore_code = run_cmd(f"cp {shlex.quote(backup_path)} {shlex.quote(config_path)}")
         if restore_code != 0:
             send(bot_token, chat_id,
                  f"❌ *{name}* config is broken and I couldn't restore the backup.\n"
+                 f"Backup: `{backup_path}`\n"
+                 f"Target: `{config_path}`\n"
                  f"Error: `{restore_out}`\n"
                  f"Config error was: `{diag.get('config_error', 'unknown')}`")
             return
@@ -492,6 +532,15 @@ def watchdog_check(bot_token: str, chat_id: int, service: dict, ollama_url: str 
             pass
         send(bot_token, chat_id,
              f"⚠️ *{name}* wasn't loaded in launchd — reloaded but still not responding.\n```\n{out}\n```")
+        return
+
+    # Restart loop prevention: if restarted 3+ times in 5 minutes, stop and alert
+    if bot_state and restart_cmd and bot_state.record_restart(name):
+        error_context = f"\n```\n{diag.get('error_log', 'no logs available')}\n```" if diag.get("error_log") else ""
+        send(bot_token, chat_id,
+             f"🔁 *{name}* has been restarted 3+ times in the last 5 minutes. "
+             f"Stopping auto-restart to prevent a loop. Please investigate manually.{error_context}")
+        log.warning(f"Watchdog: restart loop detected for {name}, halting auto-restart")
         return
 
     # Case: Try restart, then analyze if it fails
@@ -581,7 +630,7 @@ def watchdog_check(bot_token: str, chat_id: int, service: dict, ollama_url: str 
          f"Needs manual attention.{error_summary}")
 
 
-def watchdog_loop(bot_token: str, chat_id: int, cfg: dict, cfg_path: str):
+def watchdog_loop(bot_token: str, chat_id: int, cfg: dict, cfg_path: str, bot_state: "BotState | None" = None):
     """Background thread: periodically check all watched services."""
     default_interval = cfg.get("watchdog_interval_min", 15) * 60
 
@@ -604,7 +653,7 @@ def watchdog_loop(bot_token: str, chat_id: int, cfg: dict, cfg_path: str):
 
             for svc in services:
                 try:
-                    watchdog_check(bot_token, chat_id, svc, ollama_url, ollama_model)
+                    watchdog_check(bot_token, chat_id, svc, ollama_url, ollama_model, bot_state=bot_state)
                 except Exception as e:
                     log.error(f"Watchdog error for {svc.get('name')}: {e}")
 
@@ -694,11 +743,22 @@ class BotState:
         self.pending: dict[str, str] = {}  # callback_id → command
         self.pending_skills: dict[str, dict] = {}  # callback_id → {trigger, cmd}
         self.pending_restores: dict[str, dict] = {}  # callback_id → {backup, config, restart_cmd}
+        self.pending_full_outputs: dict[str, str] = {}  # callback_id → full output text
         self.failed_auth_attempts: int = 0
         self.auth_locked_until: float = 0  # timestamp when lockout expires
         self.conversation: list[dict] = []  # rolling context window
         self.MAX_CONTEXT = 10
         self.update_available: bool = False
+
+        # Session unlock: after correct password, stay unlocked for N minutes
+        self.shell_session_timeout_min: int = int(cfg.get("shell_session_timeout_min", 10))
+        self.shell_unlocked_until: float = 0  # timestamp when session expires
+
+        # Watchdog restart loop prevention: service_name → list of restart timestamps
+        self.restart_history: dict[str, list[float]] = {}
+
+        # Track creation time of pending entries for stale cleanup
+        self.pending_timestamps: dict[str, float] = {}
 
         self.system_prompt = (
             "You are ClawDoc, an OpenClaw maintenance agent accessible via Telegram. "
@@ -773,10 +833,66 @@ class BotState:
     def send(self, text: str, reply_markup=None):
         send(self.bot_token, self.allowed_chat_id, text, reply_markup)
 
+    def send_summary(self, cmd: str, output: str, failed: bool = False, exit_code: int = 0):
+        """Send command output summary, with a 'Show full output' button if output > 3000 chars."""
+        summary, full = _summarize_output(self, cmd, output, failed=failed, exit_code=exit_code)
+        if full:
+            cid = str(uuid.uuid4())[:8]
+            self.pending_full_outputs[cid] = full
+            self.pending_timestamps[cid] = time.time()
+            markup = {"inline_keyboard": [[
+                {"text": "📄 Show full output", "callback_data": f"fullout:{cid}"},
+            ]]}
+            self.send(summary, reply_markup=markup)
+        else:
+            self.send(summary)
+
     def reload_config(self):
         self.cfg = load_config(self.cfg_path)
         self.ollama_url = self.cfg.get("ollama_url", "http://localhost:11434")
         self.ollama_model = self.cfg.get("ollama_model", "qwen3.5:4b")
+        self.shell_security = self.cfg.get("shell_security", SECURITY_DISABLED)
+        self.shell_password_hash = self.cfg.get("shell_password_hash", "")
+        self.shell_session_timeout_min = int(self.cfg.get("shell_session_timeout_min", 10))
+
+    def is_session_unlocked(self) -> bool:
+        """Check if the shell session is currently unlocked (password mode only)."""
+        return (self.shell_security == SECURITY_PASSWORD
+                and self.shell_unlocked_until > time.time())
+
+    def unlock_session(self):
+        """Unlock the shell session for the configured timeout period."""
+        self.shell_unlocked_until = time.time() + self.shell_session_timeout_min * 60
+
+    def lock_session(self):
+        """Immediately lock the shell session."""
+        self.shell_unlocked_until = 0
+
+    def session_remaining_str(self) -> str:
+        """Return a human-readable string of remaining session time."""
+        remaining = self.shell_unlocked_until - time.time()
+        if remaining <= 0:
+            return ""
+        mins = int(remaining // 60)
+        secs = int(remaining % 60)
+        if mins > 0:
+            return f"{mins}m {secs}s"
+        return f"{secs}s"
+
+    def track_pending(self, cid: str):
+        """Record creation time for stale cleanup."""
+        self.pending_timestamps[cid] = time.time()
+
+    def record_restart(self, service_name: str) -> bool:
+        """Record a restart and return True if restart loop detected (3+ in 5 min)."""
+        now = time.time()
+        if service_name not in self.restart_history:
+            self.restart_history[service_name] = []
+        history = self.restart_history[service_name]
+        # Prune entries older than 5 minutes
+        history[:] = [t for t in history if now - t < 300]
+        history.append(now)
+        return len(history) >= 3
 
     def add_to_context(self, role: str, content: str):
         self.conversation.append({"role": role, "content": content})
@@ -832,7 +948,11 @@ class BotState:
         return any(cmd_stripped.startswith(p) for p in safe_prefixes)
 
     def send_with_approval(self, text: str, cmd: str):
-        # Safe commands (restarts, diagnostics, read-only) just run immediately
+        # NOTE: This is ONLY called for AI-suggested commands (from parse_ai_response).
+        # User-initiated /run commands go through handle_message which directly prompts
+        # for password in password mode — they never reach this method.
+        # Safe commands (restarts, diagnostics, read-only) run immediately without
+        # password, which is intentional for AI-suggested diagnostic commands.
         if self.is_safe_command(cmd):
             self.send(f"▶ `{cmd}`")
             out, code = run_cmd(cmd, timeout=60)
@@ -865,13 +985,13 @@ class BotState:
             elif restarted_svc and code != 0:
                 self.send(f"❌ Restart failed (exit {code}):\n```\n{out[-500:]}\n```")
             else:
-                summary = _summarize_output(self, cmd, out, failed=(code != 0), exit_code=code)
-                self.send(summary)
+                self.send_summary(cmd, out, failed=(code != 0), exit_code=code)
             return
 
         # AI-suggested commands always get one-tap approval (no password)
         cid = str(uuid.uuid4())[:8]
         self.pending[cid] = cmd
+        self.track_pending(cid)
         markup = {"inline_keyboard": [[
             {"text": "▶ Run it", "callback_data": f"run:{cid}"},
             {"text": "✗ Cancel", "callback_data": f"cancel:{cid}"},
@@ -932,8 +1052,11 @@ def is_blocked_command(cmd: str) -> bool:
     return False
 
 
-def _summarize_output(bot, cmd: str, output: str, failed: bool = False, exit_code: int = 0) -> str:
-    """Explain command output in human terms. Uses AI if available, otherwise pattern matching."""
+def _summarize_output(bot, cmd: str, output: str, failed: bool = False, exit_code: int = 0) -> tuple[str, str | None]:
+    """Explain command output in human terms. Uses AI if available, otherwise pattern matching.
+    Returns (summary_text, full_output_or_none). If full_output is not None, caller should
+    offer a 'Show full output' button."""
+    is_long = len(output) > 3000
     # Truncate output for display
     display_out = output[-500:] if len(output) > 500 else output
 
@@ -950,39 +1073,41 @@ def _summarize_output(bot, cmd: str, output: str, failed: bool = False, exit_cod
         )
         explanation = ollama_chat(bot.ollama_url, bot.ollama_model, "", [{"role": "user", "content": prompt}], timeout=30)
         if explanation and explanation.strip():
+            full = output if is_long else None
             if failed:
-                return f"❌ Command failed (exit {exit_code})\n\n{explanation.strip()}\n\n_Details:_\n```\n{display_out}\n```"
-            return f"✅ {explanation.strip()}\n\n_Details:_\n```\n{display_out}\n```"
+                return f"❌ Command failed (exit {exit_code})\n\n{explanation.strip()}\n\n_Details:_\n```\n{display_out}\n```", full
+            return f"✅ {explanation.strip()}\n\n_Details:_\n```\n{display_out}\n```", full
 
     # No AI — use pattern matching for common outputs
+    full = output if is_long else None
     cmd_lower = cmd.lower().strip()
     if failed:
         if "not found" in output.lower():
-            return f"❌ Command not found. `{cmd.split()[0]}` may not be installed.\n```\n{display_out}\n```"
+            return f"❌ Command not found. `{cmd.split()[0]}` may not be installed.\n```\n{display_out}\n```", full
         if "permission denied" in output.lower():
-            return f"❌ Permission denied — may need elevated access.\n```\n{display_out}\n```"
-        return f"❌ Command failed (exit {exit_code}).\n```\n{display_out}\n```"
+            return f"❌ Permission denied — may need elevated access.\n```\n{display_out}\n```", full
+        return f"❌ Command failed (exit {exit_code}).\n```\n{display_out}\n```", full
 
     # Success patterns
     if not output.strip() or output.strip() == "(no output)":
-        return f"✅ `{cmd}` completed successfully (no output)."
+        return f"✅ `{cmd}` completed successfully (no output).", None
     if "tail" in cmd_lower or "log" in cmd_lower:
-        return f"📋 *Recent log entries:*\n```\n{display_out}\n```"
+        return f"📋 *Recent log entries:*\n```\n{display_out}\n```", full
     if "ps aux" in cmd_lower or "ps -ef" in cmd_lower:
-        return f"📡 *Running processes:*\n```\n{display_out}\n```"
+        return f"📡 *Running processes:*\n```\n{display_out}\n```", full
     if "lsof" in cmd_lower:
-        return f"🔍 *Port/file usage:*\n```\n{display_out}\n```"
+        return f"🔍 *Port/file usage:*\n```\n{display_out}\n```", full
     if "uptime" in cmd_lower:
-        return f"⏱ *Uptime:* `{output.strip()}`"
+        return f"⏱ *Uptime:* `{output.strip()}`", None
     if "launchctl" in cmd_lower:
         if "not find" in output.lower() or "not loaded" in output.lower():
-            return f"⚠️ Service not loaded in launchd.\n```\n{display_out}\n```"
-        return f"✅ *launchd status:*\n```\n{display_out}\n```"
+            return f"⚠️ Service not loaded in launchd.\n```\n{display_out}\n```", full
+        return f"✅ *launchd status:*\n```\n{display_out}\n```", full
     if "df" in cmd_lower:
-        return f"💾 *Disk usage:*\n```\n{display_out}\n```"
+        return f"💾 *Disk usage:*\n```\n{display_out}\n```", full
 
     # Generic success
-    return f"✅ Done.\n```\n{display_out}\n```"
+    return f"✅ Done.\n```\n{display_out}\n```", full
 
 
 def parse_ai_response(response: str) -> tuple[str, str | None]:
@@ -1116,6 +1241,8 @@ def commands_text(skills: dict) -> str:
         "`/net` — network + IPs",
         "`/backup` — snapshot configs now",
         "`/rollback` — restore a previous config",
+        "`/lock` — re-lock shell session",
+        "`/reload` — re-read config from disk",
         "`/models` — manage Ollama models",
         "`/skills` — custom shortcuts",
         "`/update` — update ClawDoc",
@@ -1261,9 +1388,10 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
             cid = list(bot.pending_auth.keys())[-1]
             cmd = bot.pending_auth.pop(cid)
             bot.send(f"🔓 Authenticated. Running: `{cmd}`")
+            # Unlock the session so subsequent /run commands don't need password
+            bot.unlock_session()
             out, code = run_cmd(cmd, timeout=60)
-            summary = _summarize_output(bot, cmd, out, failed=(code != 0), exit_code=code)
-            bot.send(summary)
+            bot.send_summary(cmd, out, failed=(code != 0), exit_code=code)
             return
         elif not text.startswith("/"):
             # Delete the failed password attempt from chat
@@ -1315,6 +1443,10 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
 
     elif text == "/status":
         status = system_status()
+        # Show session unlock status
+        if bot.is_session_unlocked():
+            remaining = bot.session_remaining_str()
+            status += f"\n\n🔓 *Shell session unlocked* ({remaining} remaining)"
         # Check watched services and build buttons for down ones
         services = bot.cfg.get("watched_services", [])
         buttons = []
@@ -1512,14 +1644,30 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
         if not cmd:
             bot.send("Usage: `/run <command>`")
             return
+        # User-initiated /run commands: password mode always requires auth
+        # (unless session is unlocked via prior successful auth)
         if bot.shell_security == SECURITY_PASSWORD:
+            if bot.is_session_unlocked():
+                # Session is unlocked — run directly with approval button
+                cid = str(uuid.uuid4())[:8]
+                bot.pending[cid] = cmd
+                bot.track_pending(cid)
+                remaining = bot.session_remaining_str()
+                markup = {"inline_keyboard": [[
+                    {"text": "▶ Run it", "callback_data": f"run:{cid}"},
+                    {"text": "✗ Cancel", "callback_data": f"cancel:{cid}"},
+                ]]}
+                bot.send(f"🔓 _Session unlocked ({remaining} left)_\n⚡ `{cmd}`", reply_markup=markup)
+                return
             cid = str(uuid.uuid4())[:8]
             bot.pending_auth[cid] = cmd
+            bot.track_pending(cid)
             bot.send(f"🔐 *Password required*\nReply with your password to run:\n`{cmd}`\n\n_Send /cancel to abort._")
             return
         # Open mode — approve button
         cid = str(uuid.uuid4())[:8]
         bot.pending[cid] = cmd
+        bot.track_pending(cid)
         markup = {"inline_keyboard": [[
             {"text": "▶ Run it", "callback_data": f"run:{cid}"},
             {"text": "✗ Cancel", "callback_data": f"cancel:{cid}"},
@@ -1585,7 +1733,25 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
                 files[base].append(f)
             for base, versions in files.items():
                 latest = versions[-1]
+                # Use the previous version if available, otherwise use the
+                # single backup if it differs from the current live file
                 prev = versions[-2] if len(versions) >= 2 else None
+                if not prev and len(versions) == 1:
+                    # Single backup — check if it differs from live file
+                    orig_path = None
+                    for svc in bot.cfg.get("watched_services", []):
+                        if svc.get("name", "").lower().replace(" ", "-") == svc_dir.name:
+                            for cf in svc.get("config_files", []):
+                                if Path(cf).name == base:
+                                    orig_path = cf
+                                    break
+                    if orig_path:
+                        live = Path(orig_path).expanduser()
+                        try:
+                            if live.exists() and live.read_text() != latest.read_text():
+                                prev = latest  # single backup differs from live
+                        except Exception:
+                            pass
                 if prev:
                     found = True
                     # Find original path from watched services config
@@ -1605,6 +1771,7 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
                     rid = str(uuid.uuid4())[:8]
                     config_path = str(Path(orig_path).expanduser()) if orig_path else ""
                     bot.pending_restores[rid] = {"backup": str(prev), "config": config_path, "restart_cmd": restart_cmd}
+                    bot.pending_timestamps[rid] = time.time()
                     ts_raw = prev.name.rsplit(".", 1)[-1] if "." in prev.name else ""
                     age = ""
                     try:
@@ -1619,10 +1786,14 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
                             age = f"{delta.seconds // 60}m ago"
                     except Exception:
                         age = ts_raw
-                    buttons.append([{
-                        "text": f"⏪ {svc_dir.name}/{base} ({age})",
-                        "callback_data": f"restore:{rid}",
-                    }])
+                    # Diff preview button alongside restore button
+                    did = str(uuid.uuid4())[:8]
+                    bot.pending_restores[did] = {"backup": str(prev), "config": config_path, "preview_only": True}
+                    bot.pending_timestamps[did] = time.time()
+                    buttons.append([
+                        {"text": f"⏪ {svc_dir.name}/{base} ({age})", "callback_data": f"restore:{rid}"},
+                        {"text": f"🔍 Diff", "callback_data": f"preview_diff:{did}"},
+                    ])
 
         if not found:
             bot.send("No previous versions to roll back to yet. Backups are taken on each ClawDoc startup.")
@@ -1633,7 +1804,7 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
 
     elif text == "/backup":
         backup_dir = Path(bot.cfg.get("backup_dir", "~/.config/clawdoc/backups")).expanduser()
-        count = 0
+        backed_up = []
         for svc in bot.cfg.get("watched_services", []):
             for cf in svc.get("config_files", []):
                 src = Path(cf).expanduser()
@@ -1642,11 +1813,13 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
                     ts = time.strftime("%Y%m%d-%H%M%S")
                     dest = backup_dir / svc_name / f"{src.name}.{ts}"
                     dest.parent.mkdir(parents=True, exist_ok=True)
-
                     shutil.copy2(src, dest)
-                    count += 1
-        if count:
-            bot.send(f"✅ Backed up {count} config file(s).")
+                    backed_up.append((svc.get("name", svc_name), str(src), str(dest)))
+        if backed_up:
+            lines = [f"✅ Backed up {len(backed_up)} config file(s):\n"]
+            for svc_name, src_path, dest_path in backed_up:
+                lines.append(f"• *{svc_name}*: `{src_path}`\n  → `{dest_path}`")
+            bot.send("\n".join(lines))
         else:
             bot.send("No config files to back up. Add `config_files` to your watched services:\n"
                      '`"config_files": ["~/.openclaw/openclaw.json"]`')
@@ -1732,6 +1905,7 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
         services = cfg.get("watched_services", [])
         net_on = cfg.get("network_monitor", True)
         shell_mode = cfg.get("shell_security", "disabled")
+        session_timeout = cfg.get("shell_session_timeout_min", 10)
         lines = [
             f"⚙️ *ClawDoc Settings*\n",
             f"Model: `{cfg.get('ollama_model', 'not set')}`",
@@ -1739,9 +1913,17 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
             f"Watchdog interval: `{cfg.get('watchdog_interval_min', 15)} min`",
             f"Network monitor: `{'on' if net_on else 'off'}`",
             f"Shell access: `{shell_mode}`",
+        ]
+        if shell_mode == "password":
+            lines.append(f"Session unlock timeout: `{session_timeout} min`")
+            if bot.is_session_unlocked():
+                lines.append(f"🔓 Session: *unlocked* ({bot.session_remaining_str()} remaining)")
+            else:
+                lines.append(f"🔒 Session: *locked*")
+        lines.extend([
             f"Transcription: `{cfg.get('transcription', 'auto')}`",
             f"Watched services: `{len(services)}`",
-        ]
+        ])
         wd_min = cfg.get("watchdog_interval_min", 15)
         buttons = [
             [{"text": f"👀 Watchdog interval: {wd_min} min", "callback_data": "toggle:wd_picker"}],
@@ -1749,6 +1931,23 @@ def handle_message(bot: BotState, text: str, cfg_path: str, message_id: int = No
             [{"text": f"🔒 Shell: {shell_mode}", "callback_data": "toggle:shell_info"}],
         ]
         bot.send("\n".join(lines), reply_markup={"inline_keyboard": buttons})
+
+    elif text == "/lock":
+        if bot.shell_security != SECURITY_PASSWORD:
+            bot.send("🔒 Lock is only relevant in password mode.")
+            return
+        if bot.is_session_unlocked():
+            bot.lock_session()
+            bot.send("🔒 Session locked. Next /run will require password.")
+        else:
+            bot.send("🔒 Session is already locked.")
+
+    elif text == "/reload":
+        try:
+            bot.reload_config()
+            bot.send("✅ Config reloaded from disk.")
+        except Exception as e:
+            bot.send(f"❌ Failed to reload config: `{e}`")
 
     elif text.startswith("/"):
         bot.send("Unknown command. Try /help")
@@ -1954,12 +2153,7 @@ def handle_callback(bot: BotState, chat_id: int, callback_query_id: str, message
             bot.send(f"❌ *{restarted_svc.get('name', 'Service')}* restart failed (exit {code}):\n```\n{out[-500:]}\n```")
         else:
             # Try to explain the output instead of raw dump
-            if code == 0:
-                summary = _summarize_output(bot, cmd, out)
-                bot.send(summary)
-            else:
-                summary = _summarize_output(bot, cmd, out, failed=True, exit_code=code)
-                bot.send(summary)
+            bot.send_summary(cmd, out, failed=(code != 0), exit_code=code)
 
     elif data.startswith("cancel:"):
         cid = data[7:]
@@ -1984,17 +2178,75 @@ def handle_callback(bot: BotState, chat_id: int, callback_query_id: str, message
                          f"🔓 Run this on your terminal to activate open mode:\n\n"
                          f"`python3 clawdoc.py --activate {bot.activation_code} --enable-shell open`")
 
+    elif data.startswith("preview_diff:"):
+        did = data[13:]
+        info = bot.pending_restores.get(did)
+        if not info:
+            answer_callback(bot.bot_token, callback_query_id, "Expired.")
+            return
+        answer_callback(bot.bot_token, callback_query_id, "Generating diff...")
+        backup_path = info.get("backup", "")
+        config_path = info.get("config", "")
+        try:
+            backup_lines = Path(backup_path).read_text().splitlines(keepends=True)
+            config_lines = Path(config_path).read_text().splitlines(keepends=True)
+            diff = difflib.unified_diff(config_lines, backup_lines,
+                                        fromfile="current", tofile="backup", lineterm="")
+            diff_text = "\n".join(diff)
+            if not diff_text.strip():
+                send(bot.bot_token, chat_id, "📋 No differences — backup matches current file.")
+            elif len(diff_text) > 3500:
+                send_document(bot.bot_token, chat_id,
+                              diff_text.encode(), "diff.patch",
+                              caption="📋 Diff is large — sent as file.")
+            else:
+                send(bot.bot_token, chat_id, f"📋 *Diff (current → backup):*\n```\n{diff_text}\n```")
+        except Exception as e:
+            send(bot.bot_token, chat_id, f"❌ Could not generate diff: `{e}`")
+
+    elif data.startswith("fullout:"):
+        cid = data[8:]
+        full = bot.pending_full_outputs.pop(cid, None)
+        bot.pending_timestamps.pop(cid, None)
+        if not full:
+            answer_callback(bot.bot_token, callback_query_id, "Expired.")
+            return
+        answer_callback(bot.bot_token, callback_query_id, "Sending full output...")
+        send_document(bot.bot_token, chat_id,
+                      full.encode(), "output.txt",
+                      caption="📄 Full command output")
+
     elif data.startswith("restore:"):
         rid = data[8:]
         info = bot.pending_restores.pop(rid, None)
+        bot.pending_timestamps.pop(rid, None)
         if not info:
             answer_callback(bot.bot_token, callback_query_id, "Expired or already handled.")
             return
         answer_callback(bot.bot_token, callback_query_id, "Restoring config...")
         edit_message(bot.bot_token, chat_id, message_id, "⏳ Restoring config from backup...")
-        out, code = run_cmd(f"cp {info['backup']} {info['config']}")
+
+        backup_path = info['backup']
+        config_path = info['config']
+
+        # Validate JSON before restoring (if it's a JSON file)
+        if config_path.endswith(".json"):
+            try:
+                json.loads(Path(backup_path).read_text())
+            except (json.JSONDecodeError, Exception) as e:
+                send(bot.bot_token, chat_id,
+                     f"❌ Backup file is not valid JSON — aborting restore.\n"
+                     f"File: `{backup_path}`\n"
+                     f"Error: `{e}`")
+                return
+
+        out, code = run_cmd(f"cp {shlex.quote(backup_path)} {shlex.quote(config_path)}")
         if code != 0:
-            send(bot.bot_token, chat_id, f"❌ Failed to restore config:\n```\n{out}\n```")
+            send(bot.bot_token, chat_id,
+                 f"❌ Failed to restore config.\n"
+                 f"Backup: `{backup_path}`\n"
+                 f"Target: `{config_path}`\n"
+                 f"Error: `{out}`")
             return
         send(bot.bot_token, chat_id, "✅ Config restored from backup. Restarting...")
         restart_cmd = info.get("restart_cmd", "")
@@ -2354,6 +2606,8 @@ def main():
         {"command": "rollback", "description": "Restore a previous config"},
         {"command": "backup", "description": "Snapshot configs now"},
         {"command": "run", "description": "Run a shell command"},
+        {"command": "lock", "description": "Re-lock shell session"},
+        {"command": "reload", "description": "Re-read config from disk"},
         {"command": "net", "description": "Network status & IPs"},
         {"command": "models", "description": "Manage Ollama models"},
         {"command": "skills", "description": "View custom shortcuts"},
@@ -2367,16 +2621,51 @@ def main():
     if bot.update_available:
         log.info("Update available from remote")
 
-    # Send startup message (only if claimed)
+    # Send startup message with health check (only if claimed)
     if bot.allowed_chat_id:
         hostname = platform.node()
         os_name = platform.system()
         machine = platform.machine()
-        bot.send(f"🔧 *ClawDoc is online*\n{hostname} · {os_name} {machine}\nType /start for commands.")
+        startup_msg = f"🔧 *ClawDoc is online*\n{hostname} · {os_name} {machine}"
+        # Health check on startup
+        for svc in cfg.get("watched_services", []):
+            svc_name = svc.get("name", svc.get("url", "?"))
+            url = svc.get("url", "")
+            if url:
+                try:
+                    with urllib.request.urlopen(url, timeout=3) as r:
+                        icon = "✅" if r.status < 400 else "❌"
+                except Exception:
+                    icon = "❌"
+                startup_msg += f"\n{icon} {svc_name}"
+        startup_msg += "\nType /start for commands."
+        bot.send(startup_msg)
+        # Notify about any pending commands that were lost on restart
+        bot.send("ℹ️ _Bot restarted. Any pending commands or auth sessions from before the restart were cancelled._")
 
     # Start watchdog (only if claimed — otherwise no one to alert)
     if bot.allowed_chat_id:
-        watchdog_loop(bot.bot_token, bot.allowed_chat_id, cfg, args.config)
+        watchdog_loop(bot.bot_token, bot.allowed_chat_id, cfg, args.config, bot_state=bot)
+
+    # Stale pending entry cleanup (prunes entries older than 30 minutes)
+    def _stale_cleanup():
+        while True:
+            time.sleep(300)  # check every 5 minutes
+            try:
+                now = time.time()
+                cutoff = now - 1800  # 30 minutes
+                stale_keys = [k for k, t in bot.pending_timestamps.items() if t < cutoff]
+                for k in stale_keys:
+                    bot.pending.pop(k, None)
+                    bot.pending_auth.pop(k, None)
+                    bot.pending_restores.pop(k, None)
+                    bot.pending_full_outputs.pop(k, None)
+                    bot.pending_timestamps.pop(k, None)
+                if stale_keys:
+                    log.info(f"Cleaned up {len(stale_keys)} stale pending entries")
+            except Exception as e:
+                log.error(f"Stale cleanup error: {e}")
+    threading.Thread(target=_stale_cleanup, daemon=True, name="stale-cleanup").start()
 
     # Periodic update check (every 6 hours)
     def _update_checker():

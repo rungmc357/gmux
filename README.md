@@ -10,7 +10,7 @@ A self-hosted Telegram bot that keeps your [OpenClaw](https://openclaw.ai) runni
 
 - **Automatic recovery** — checks OpenClaw every 15 minutes. If something breaks, it figures out why, fixes it, and tells you what happened.
 - **Remote control** — restart services, check system health, and view logs from anywhere. Everything is a button tap in Telegram.
-- **Config rollback** — your config is backed up automatically. If an update breaks something, pick any previous version and restore it with one tap.
+- **Config rollback** — your config is backed up automatically. If an update breaks something, preview the diff and restore any previous version with one tap.
 - **Full diagnostics** — one button runs a complete health check and tells you exactly what's wrong. If it can fix the problem, it gives you a button for that too.
 - **Network monitoring** — watches your connection and notifies you when it drops or comes back, along with how long the outage lasted.
 
@@ -86,6 +86,7 @@ Config lives at `~/.config/clawdoc/config.json`. Most settings can be changed vi
   "allowed_chat_id": 123456789,
   "ollama_model": "qwen3.5:4b",
   "shell_security": "disabled",
+  "shell_session_timeout_min": 10,
   "watchdog_interval_min": 15,
   "network_monitor": true,
   "watched_services": [
@@ -99,6 +100,23 @@ Config lives at `~/.config/clawdoc/config.json`. Most settings can be changed vi
   ]
 }
 ```
+
+### New commands
+
+- `/lock` — immediately re-lock the shell session (password mode only)
+- `/reload` — re-read config from disk without restarting
+
+### Session unlock (password mode)
+
+When `shell_security` is `"password"`, entering your password once unlocks the session for `shell_session_timeout_min` minutes (default 10). During this window, `/run` commands only need tap-to-approve, no password. Use `/lock` to re-lock early. The unlock status and time remaining are shown in `/status` and `/settings`.
+
+### Watchdog loop guard
+
+If a service is auto-restarted 3+ times within 5 minutes, ClawDoc stops restarting it and alerts you instead — preventing restart loops from masking the real issue.
+
+### Rollback diff preview
+
+The `/rollback` command now shows a "Diff" button alongside each restore option. Tap it to see exactly what will change before restoring.
 
 ---
 

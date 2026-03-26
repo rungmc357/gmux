@@ -5,6 +5,7 @@
   "ollama_url": "http://localhost:11434",
   "shell_security": "disabled",
   "shell_password_hash": "",
+  "shell_session_timeout_min": 10,
   "watchdog_interval_min": 15,
   "network_monitor": true,
   "transcription": "auto",
